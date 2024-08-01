@@ -1,6 +1,9 @@
 import json
 import re
 import requests
+from twilio.rest import Client
+from datetime import datetime
+import os
 
 def identify_provider(tracking_code):
     carriers = {
@@ -108,28 +111,75 @@ def make_request(tracking_code, provider_type):
     return response.json()
 
 def lambda_handler(event, context):
-    tracking_code = event.get('tracking_code')
-    
-    if not tracking_code:
-        return {
-            "message": "Tracking code is required."
-        }
-    
-    provider = identify_provider(tracking_code)
-    
-    if not provider:
-        return {
-            "message": "Provider could not be identified."
-        }
-    
-    response_json = make_request(tracking_code, provider)
-    
-    if 'errors' in response_json:
-        if isinstance(response_json['errors'], list):
-            return response_json
-        else:
+    try:
+        wa_id = event.get('From')
+        body = event.get('Body')
+        to = event.get('To')
+        
+        if not body:
             return {
-                "message": "Unable to complete the request."
+                "message": "Body is required."
             }
-    else:
-        return response_json
+
+        tracking_code = body
+        provider = identify_provider(tracking_code)
+        
+        if not provider:
+            return {
+                "message": "Provider could not be identified."
+            }
+        
+        response_json = make_request(tracking_code, provider)
+        
+        if 'errors' in response_json:
+            if isinstance(response_json['errors'], list):
+                return response_json
+            else:
+                return {
+                    "message": "Unable to complete the request."
+                }
+        else:
+            return handle_message(response_json, wa_id, to)
+    except Exception as e:
+        return {
+            "message": f"Error processing request: {str(e)}"
+        }
+
+def handle_message(response_json, from_, to_):
+    account_sid = os.getenv("account_sid")
+    auth_token = os.getenv("auth_token")
+    client = Client(account_sid, auth_token)
+
+    text = format_tracking_history(response_json["data"]["result"]["trackingEvents"])
+    
+    client.messages.create(
+        from_=to_,
+        body=f'{text}',
+        to=from_
+    )
+    
+    return {
+        "message": "Message sent successfully."
+    }
+
+def format_tracking_history(tracking_events):
+    return create_history_entry(tracking_events[0])
+
+
+def create_history_entry(event):
+    if not event.get("title"):
+        return None
+    
+    created_at = format_date(event['createdAt'])
+    entry = f"📦 Código de Rastreamento: *{event['trackingCode']}* \n📅 Data: {created_at} \nℹ️ Situação: {event['title']} \n📦 De: {event['from']}"
+    if event.get("to"):
+        entry += f"\n📬 Para: {event['to']}"
+        
+    if event.get("additionalInfo"):
+        entry += f"\nℹ🔍 Informações adicionais: {event['additionalInfo']}"
+    
+    return entry
+
+def format_date(date_str):
+    dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    return dt.strftime("%d/%m/%Y às %H:%M")
