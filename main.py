@@ -1,9 +1,10 @@
-import json
 import re
-import requests
-from twilio.rest import Client
-from datetime import datetime
 import os
+import base64
+import requests
+import urllib.parse
+from datetime import datetime
+from twilio.rest import Client
 
 def identify_provider(tracking_code):
     carriers = {
@@ -27,7 +28,8 @@ def make_request(tracking_code, provider_type):
     url = 'https://api.melhorrastreio.com.br/graphql'
     headers = {
         'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'Cache-Control': 'no-cache'
     }
     body = {
         "query": """
@@ -111,10 +113,8 @@ def make_request(tracking_code, provider_type):
     return response.json()
 
 def lambda_handler(event, context):
-    try:
-        wa_id = event.get('From')
-        body = event.get('Body')
-        to = event.get('To')
+    try:        
+        from_, body, to = decode_values(event['body'])
         
         if not body:
             return {
@@ -130,7 +130,6 @@ def lambda_handler(event, context):
             }
         
         response_json = make_request(tracking_code, provider)
-        
         if 'errors' in response_json:
             if isinstance(response_json['errors'], list):
                 return response_json
@@ -139,47 +138,76 @@ def lambda_handler(event, context):
                     "message": "Unable to complete the request."
                 }
         else:
-            return handle_message(response_json, wa_id, to)
+            handle_message(response_json, to, from_)
+            return {
+                    "message": "Message sent successfully."
+                }
     except Exception as e:
         return {
             "message": f"Error processing request: {str(e)}"
         }
 
-def handle_message(response_json, from_, to_):
+def format_date(date_str):
+    dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    return dt.strftime("%d/%m/%Y às %H:%M")
+
+def send_message(text, from_, to_):
     account_sid = os.getenv("account_sid")
     auth_token = os.getenv("auth_token")
     client = Client(account_sid, auth_token)
 
-    text = format_tracking_history(response_json["data"]["result"]["trackingEvents"])
-    
     client.messages.create(
-        from_=to_,
+        from_=from_,
         body=f'{text}',
-        to=from_
+        to=to_
     )
+
+def handle_event_message(tracking_code, shipping_service, last_event):
+    message = f"📦 Pacote: *{tracking_code}* \n🚛 Transportadora: *{shipping_service}*"
+    message += f"\n📅 Data: {format_date(last_event.get('createdAt'))} \nℹ️ Situação: {last_event.get('title')}"
     
-    return {
-        "message": "Message sent successfully."
-    }
-
-def format_tracking_history(tracking_events):
-    return create_history_entry(tracking_events[0])
-
-
-def create_history_entry(event):
-    if not event.get("title"):
-        return None
+    if last_event.get("from"):
+        message += f"\n📦 De: {last_event.get('from')}"
     
-    created_at = format_date(event['createdAt'])
-    entry = f"📦 Código de Rastreamento: *{event['trackingCode']}* \n📅 Data: {created_at} \nℹ️ Situação: {event['title']} \n📦 De: {event['from']}"
-    if event.get("to"):
-        entry += f"\n📬 Para: {event['to']}"
-        
-    if event.get("additionalInfo"):
-        entry += f"\nℹ🔍 Informações adicionais: {event['additionalInfo']}"
+    if last_event.get("to"):
+        message += f"\n📬 Para: {last_event.get('to')}"
     
-    return entry
+    if last_event.get("additionalInfo"):
+        message += "\n🔍 Informações adicionais: "
+        additional_info = last_event.get('additionalInfo')
+        match = re.search(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', additional_info)
+        if match:
+            url = match.group(1)
+            anchor_text = match.group(2)
+            
+            decoded_url = urllib.parse.unquote(url)
+            
+            message += additional_info.replace(match.group(0), f'{anchor_text}: {decoded_url}')
+        else:
+            message += f"{additional_info}"
+            
+    return message
 
-def format_date(date_str):
-    dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-    return dt.strftime("%d/%m/%Y às %H:%M")
+def handle_message(response, from_, to_):
+    result = response["data"]["result"]
+    message = '*Não foi possível rastrear pacote!* \nVerifique se o seu código está correto. Caso esteja, tente novamente mais tarde, pois as informações podem demorar algumas horas para serem atualizadas.'
+
+    if result is not None:
+        events = result['trackingEvents']
+        if events is not None:
+            events.sort(key=lambda x: datetime.fromisoformat(x["createdAt"].replace('Z', '+00:00')), reverse=True)
+            message = handle_event_message(result['trackers'][0]['trackingCode'], result['trackers'][0]['type'].capitalize(), events[0])       
+    send_message(message, from_, to_)
+
+def decode_values(body):
+    decoded_bytes = base64.b64decode(body)
+    decoded_string = decoded_bytes.decode('utf-8')
+    params = urllib.parse.parse_qs(decoded_string)
+
+    params = {key: value[0] for key, value in params.items()}
+
+    from_param = params.get("From")
+    body_param = params.get("Body")
+    to_param = params.get("To")
+    
+    return from_param, body_param, to_param
